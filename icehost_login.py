@@ -17,7 +17,6 @@ PROXY = os.environ.get("PROXY_SOCKS5")
 
 if not EMAIL:
     raise Exception("缺少环境变量 ICEHOST_EMAIL")
-
 if not PASSWORD:
     raise Exception("缺少环境变量 ICEHOST_PASSWORD")
 
@@ -25,84 +24,106 @@ if not PASSWORD:
 def renew_server(sb):
     """执行服务器续期操作 - 进入服务器详情页后点击续期"""
     print("\n🔄 开始检查并续期服务器...")
-    
-    # 等待页面加载
     time.sleep(3)
-    
-    # 先检查当前页面是否是服务器详情页（URL包含 /server/）
+
     current_url = sb.get_current_url()
     if "/server/" in current_url:
         print("📍 已在服务器详情页")
     else:
         print("📍 当前在仪表盘首页，需要进入服务器详情页")
-        
-        # 方法1：点击"POKAŻ MOJE SERWERY" (Show my servers) 展开列表
+
+        # 1. 展开"POKAŻ MOJE SERWERY"
         try:
-            show_servers_btn = sb.find_elements('//*[contains(text(), "POKAŻ MOJE SERWERY") or contains(text(), "Show my servers")]')
-            if show_servers_btn and show_servers_btn[0].is_displayed():
-                show_servers_btn[0].click()
+            show_btn = sb.find_element('//*[contains(text(), "POKAŻ MOJE SERWERY")]', timeout=5)
+            if show_btn.is_displayed():
+                sb.execute_script("arguments[0].scrollIntoView(true);", show_btn)
+                time.sleep(0.5)
+                show_btn.click()
                 print("✅ 点击了'POKAŻ MOJE SERWERY'")
                 time.sleep(2)
+            else:
+                sb.execute_script("arguments[0].click();", show_btn)
+                print("✅ 强制点击了'POKAŻ MOJE SERWERY'")
+                time.sleep(2)
         except Exception as e:
-            print(f"展开服务器列表失败: {e}")
-        
-        # 查找服务器链接/按钮
-        server_selectors = [
-            '//a[contains(text(), "free-servers-4.icehost.pl")]',
-            '//a[contains(text(), "Amelie")]',
-            '//div[contains(text(), "free-servers-4")]/parent::a',
-            '//*[contains(@href, "/server/")]',
+            print(f"⚠️ 点击展开按钮异常: {e}")
+
+        # 2. 等待服务器列表出现
+        try:
+            sb.wait_for_element_visible('//*[contains(text(), "free-servers")]', timeout=5)
+            print("✅ 服务器列表已展开")
+        except:
+            print("⚠️ 未明确检测到服务器列表，继续尝试查找")
+
+        # 3. 🔥 关键修复：直接点击服务器条目文本 "free-servers-4.icehost.pl:30159"
+        clicked = False
+        server_texts = [
+            "free-servers-4.icehost.pl:30159",
+            "free-servers-4.icehost.pl",
+            "Amelie Serwer testowy"
         ]
         
-        clicked = False
-        for selector in server_selectors:
+        for text in server_texts:
             try:
-                elements = sb.find_elements(selector)
-                if elements:
-                    print(f"✅ 找到服务器条目: {elements[0].text if elements[0].text else selector}")
-                    elements[0].click()
+                # 尝试直接点击包含该文本的元素（无论是什么标签）
+                elem = sb.find_element(f'//*[contains(text(), "{text}")]', timeout=3)
+                if elem:
+                    # 先滚动到可见
+                    sb.execute_script("arguments[0].scrollIntoView(true);", elem)
+                    time.sleep(0.5)
+                    # 尝试点击元素本身（如果是<div>或<span>，往往可点击）
+                    elem.click()
                     clicked = True
-                    print("✅ 已点击进入服务器详情页")
+                    print(f"✅ 直接点击服务器条目文本: {text}")
                     break
-            except Exception:
-                pass
-        
-        if not clicked:
-            # 尝试查找所有href包含"/server/"的链接
-            try:
-                all_links = sb.find_elements('a[href*="/server/"]')
-                if all_links:
-                    print(f"✅ 通过href找到服务器链接: {all_links[0].get_attribute('href')}")
-                    all_links[0].click()
-                    clicked = True
             except:
-                pass
+                # 如果直接点击失败，尝试找父级的<a>链接
+                try:
+                    elem = sb.find_element(f'//*[contains(text(), "{text}")]/ancestor::a', timeout=2)
+                    if elem:
+                        elem.click()
+                        clicked = True
+                        print(f"✅ 通过父级链接点击: {text}")
+                        break
+                except:
+                    pass
         
+        # 备用方法：查找所有包含/server/的链接（如未成功）
+        if not clicked:
+            try:
+                links = sb.find_elements('a[href*="/server/"]')
+                if links:
+                    for link in links:
+                        href = link.get_attribute('href')
+                        if href and '/server/' in href:
+                            print(f"找到服务器链接: {href}")
+                            link.click()
+                            clicked = True
+                            print("✅ 点击了服务器链接")
+                            break
+            except Exception as e:
+                print(f"备用方法失败: {e}")
+
         if not clicked:
             print("❌ 未能找到服务器条目，无法进入详情页")
             sb.save_screenshot("no_server_entry.png")
             return False
-        
+
         # 等待详情页加载
         time.sleep(5)
-    
-    # 现在应该在服务器详情页了
-    current_url = sb.get_current_url()
-    print(f"📍 当前详情页URL: {current_url}")
+        print(f"📍 跳转后URL: {sb.get_current_url()}")
+
+    # 当前应处于服务器详情页
     sb.save_screenshot("server_detail_page.png")
-    
+
     # 查找并点击续期按钮
     print("🔍 查找续期按钮...")
-    
-    # 首先检查是否已经无法续期（根据截图中的提示）
     page_text = sb.get_page_source()
     if "您不能再将服务器时间延长6小时" in page_text or "cannot extend" in page_text.lower():
         print("⚠️ 检测到提示：最近已续期过，无法再次延长")
-        # 但还是尝试找按钮
     elif "Brak daty ważności" in page_text or "No expiry date" in page_text:
-        print("ℹ️ 服务器没有有效期，可能无需续期")
-    
-    # 续期按钮文本可能性
+        print("ℹ️ 服务器没有有效期，无需续期")
+
     renew_texts = [
         "增加 6 小时有效期",
         "Add 6 hours",
@@ -111,79 +132,68 @@ def renew_server(sb):
         "+6 godzin",
         "Extend by 6 hours"
     ]
-    
+
     for text in renew_texts:
         try:
             xpath = f'//*[contains(text(), "{text}")]'
             elements = sb.find_elements(xpath)
             if elements:
                 print(f"✅ 找到续期按钮: {text}")
-                # 滚动到按钮可见
                 sb.execute_script("arguments[0].scrollIntoView(true);", elements[0])
                 time.sleep(1)
                 elements[0].click()
                 print("🔘 已点击续期按钮")
                 time.sleep(3)
-                
-                # 处理可能的确认弹窗
+
+                # 处理弹窗
                 try:
                     alert = sb.driver.switch_to.alert
-                    print(f"📢 弹窗内容: {alert.text}")
+                    print(f"📢 弹窗: {alert.text}")
                     alert.accept()
-                    time.sleep(1)
                 except:
-                    # 也可能有自定义确认对话框
                     try:
-                        confirm_btn = sb.find_elements('button:contains("确认"), button:contains("OK"), button:contains("Tak")')
-                        if confirm_btn:
-                            confirm_btn[0].click()
-                            print("✅ 确认了续期")
+                        confirm = sb.find_element('button:contains("确认"), button:contains("OK"), button:contains("Tak")', timeout=2)
+                        confirm.click()
+                        print("✅ 确认了续期")
                     except:
                         pass
-                
+
                 time.sleep(2)
                 sb.refresh()
                 sb.save_screenshot("after_renew.png")
                 print("✅ 续期操作完成")
                 return True
         except Exception as e:
-            print(f"尝试文本 '{text}' 失败: {e}")
-    
-    # 如果没有找到特定文本，尝试找所有按钮中含有相关关键词的
+            print(f"尝试'{text}'失败: {e}")
+
+    # 备用：关键词查找所有按钮
     try:
         buttons = sb.find_elements('button, a')
-        print(f"🔍 共找到 {len(buttons)} 个按钮/链接，查找续期相关...")
-        for idx, btn in enumerate(buttons):
-            try:
-                btn_text = btn.text
-                if btn_text and any(kw in btn_text.lower() for kw in ["增加", "add", "dodaj", "przedłuż", "extend", "小时", "hour", "godzin"]):
-                    print(f"✅ 找到候选续期按钮 {idx}: '{btn_text}'")
-                    btn.click()
-                    time.sleep(3)
-                    sb.refresh()
-                    print("✅ 续期完成")
-                    return True
-            except:
-                pass
+        print(f"🔍 共找到 {len(buttons)} 个可点击元素")
+        for btn in buttons:
+            btn_text = btn.text
+            if btn_text and any(kw in btn_text.lower() for kw in ["增加", "add", "dodaj", "przedłuż", "extend", "小时", "hour", "godzin"]):
+                print(f"✅ 候选按钮: {btn_text}")
+                btn.click()
+                time.sleep(3)
+                sb.refresh()
+                return True
     except Exception as e:
-        print(f"查找关键词按钮失败: {e}")
-    
-    # 滚动到底部再试一次
+        print(f"关键词查找失败: {e}")
+
+    # 最后滚动到底部
     sb.execute_script("window.scrollTo(0, document.body.scrollHeight);")
     time.sleep(2)
     try:
         elem = sb.find_element('//*[contains(text(), "增加") or contains(text(), "Add")]', timeout=3)
         if elem:
             elem.click()
-            print("✅ 滚动后找到并点击")
+            print("✅ 滚动后找到续期按钮")
             return True
     except:
         pass
-    
-    print("❌ 未找到续期按钮，可能是：")
-    print("   1. 服务器已到期无法续期")
-    print("   2. 最近刚续期过，按钮不可用")
-    print("   3. 页面结构变化")
+
+    print("❌ 未找到续期按钮")
     sb.save_screenshot("renew_not_found.png")
     with open("detail_page_source.html", "w", encoding="utf-8") as f:
         f.write(sb.get_page_source())
@@ -201,184 +211,108 @@ def login_icehost():
             "Chrome/137.0.0.0 Safari/537.36"
         ),
     }
-    
     if PROXY:
         print(f"🌐 使用代理: {PROXY}")
         options["proxy"] = PROXY
-    
+
     print("🚀 启动浏览器...")
-    
     with SB(**options) as sb:
         print("🚀 打开 IceHost 登录页...")
-        
         try:
             sb.uc_open_with_reconnect(LOGIN_URL, 5)
-        except Exception:
+        except:
             sb.open(LOGIN_URL)
-        
         time.sleep(5)
         sb.save_screenshot("login_page.png")
-        print("📸 截图: login_page.png")
-        
+
         print("📝 填写账号密码...")
-        
-        # 更通用的邮箱/用户名输入框选择器
+        # 邮箱/用户名
         email_selectors = [
-            'input[name="email"]',
-            'input[name="username"]',
-            'input[type="email"]',
-            'input[placeholder*="mail" i]',
-            'input[placeholder*="email" i]',
-            'input[placeholder*="E-mail" i]',
-            'input[placeholder*="Adres" i]',
-            'input[type="text"]',
-            'input:first-of-type'
+            'input[name="email"]', 'input[name="username"]',
+            'input[type="email"]', 'input[placeholder*="mail" i]',
+            'input[placeholder*="email" i]', 'input[placeholder*="Adres" i]',
+            'input[type="text"]', 'input:first-of-type'
         ]
-        
         email_ok = False
-        for selector in email_selectors:
+        for sel in email_selectors:
             try:
-                if sb.is_element_visible(selector):
-                    sb.type(selector, EMAIL)
+                if sb.is_element_visible(sel):
+                    sb.type(sel, EMAIL)
                     email_ok = True
-                    print(f"✅ 找到邮箱框: {selector}")
+                    print(f"✅ 找到邮箱框: {sel}")
                     break
-            except Exception:
+            except:
                 pass
-        
         if not email_ok:
-            try:
-                first_input = sb.find_element('input')
-                sb.type(first_input, EMAIL)
-                email_ok = True
-                print("✅ 使用第一个输入框填写邮箱")
-            except:
-                raise Exception("未找到邮箱输入框")
-        
-        # 密码框选择器
-        password_selectors = [
-            'input[type="password"]',
-            'input[name="password"]',
-            'input[placeholder*="hasło" i]',
-            'input[placeholder*="password" i]'
+            sb.type(sb.find_element('input'), EMAIL)
+            print("✅ 使用第一个输入框")
+
+        # 密码
+        pwd_selectors = [
+            'input[type="password"]', 'input[name="password"]',
+            'input[placeholder*="hasło" i]'
         ]
-        
         pwd_ok = False
-        for selector in password_selectors:
+        for sel in pwd_selectors:
             try:
-                if sb.is_element_visible(selector):
-                    sb.type(selector, PASSWORD)
+                if sb.is_element_visible(sel):
+                    sb.type(sel, PASSWORD)
                     pwd_ok = True
-                    print(f"✅ 找到密码框: {selector}")
+                    print(f"✅ 找到密码框: {sel}")
                     break
-            except Exception:
-                pass
-        
-        if not pwd_ok:
-            try:
-                inputs = sb.find_elements('input')
-                if len(inputs) >= 2:
-                    sb.type(inputs[1], PASSWORD)
-                    pwd_ok = True
-                    print("✅ 使用第二个输入框填写密码")
             except:
-                raise Exception("未找到密码输入框")
-        
+                pass
+        if not pwd_ok:
+            sb.type(sb.find_elements('input')[1], PASSWORD)
+            print("✅ 使用第二个输入框")
+
         print("🔐 提交登录...")
-        
-        # 登录按钮选择器
-        button_selectors = [
+        btn_selectors = [
             'button[type="submit"]',
             'button:contains("Załoguj się")',
             'button:contains("Login")',
-            'button:contains("Sign in")',
-            'button',
-            'input[type="submit"]'
+            'button'
         ]
-        
         clicked = False
-        for selector in button_selectors:
+        for sel in btn_selectors:
             try:
-                if selector.startswith('button:contains'):
-                    if sb.is_element_visible(selector):
-                        sb.click(selector)
-                        clicked = True
-                        print(f"✅ 点击登录按钮: {selector}")
-                        break
-                else:
-                    if sb.is_element_visible(selector):
-                        sb.click(selector)
-                        clicked = True
-                        print(f"✅ 点击登录按钮: {selector}")
-                        break
-            except Exception:
-                pass
-        
-        if not clicked:
-            try:
-                sb.press_enter('input[type="password"]')
-                print("✅ 使用回车键提交")
-                clicked = True
+                if sb.is_element_visible(sel):
+                    sb.click(sel)
+                    clicked = True
+                    print(f"✅ 点击登录按钮: {sel}")
+                    break
             except:
                 pass
-        
         if not clicked:
-            raise Exception("未找到登录按钮且回车无效")
-        
-        print("⏳ 等待登录跳转...")
+            sb.press_enter('input[type="password"]')
+            print("✅ 使用回车提交")
+
+        print("⏳ 等待登录...")
         time.sleep(8)
-        
-        # 判断是否登录成功
+
+        # 判断登录成功
         page_source = sb.get_page_source()
         current_url = sb.get_current_url()
         print(f"📍 当前页面: {current_url}")
-        
-        success_indicators = [
-            "账户余额",
-            "服务器",
-            "Serwery",
-            "Konto",
-            "余额",
-            "截止日期",
-            "有效期至",
-            "delete date"
-        ]
-        
-        is_logged_in = False
-        for indicator in success_indicators:
-            if indicator.lower() in page_source.lower():
-                is_logged_in = True
-                print(f"✅ 检测到成功标志: {indicator}")
-                break
-        
-        if not is_logged_in and "/auth/login" not in current_url and "/login" not in current_url:
-            is_logged_in = True
-            print("✅ URL不是登录页，假定成功")
-        
+
+        success_keywords = ["Serwery", "账户余额", "服务器", "Konto", "余额"]
+        login_ok = any(kw in page_source for kw in success_keywords) or ("/auth/login" not in current_url)
+
         sb.save_screenshot("after_login.png")
-        print("📸 截图: after_login.png")
-        
-        if not is_logged_in:
-            print("❌ 登录失败，请检查账号密码或代理")
+        if not login_ok:
+            print("❌ 登录失败")
             with open("login_failed.html", "w", encoding="utf-8") as f:
-                f.write(sb.get_page_source())
+                f.write(page_source)
             return False
-        
+
         print("🎉 登录成功！")
-        # 执行续期
-        renew_success = renew_server(sb)
-        return renew_success
+        return renew_server(sb)
 
 
 if __name__ == "__main__":
     try:
         result = login_icehost()
-        if result:
-            print("🏁 任务完成 - 服务器已成功续期")
-            exit(0)
-        else:
-            print("💥 任务失败")
-            exit(1)
+        exit(0 if result else 1)
     except Exception as e:
         print(f"❌ 异常: {e}")
         import traceback
