@@ -2,7 +2,9 @@
 # -*- coding: utf-8 -*-
 
 import os
+import re
 import time
+from datetime import datetime, timedelta
 from seleniumbase import SB
 
 # =========================
@@ -15,24 +17,60 @@ EMAIL = os.environ.get("ICEHOST_EMAIL")
 PASSWORD = os.environ.get("ICEHOST_PASSWORD")
 PROXY = os.environ.get("PROXY_SOCKS5")
 
+# 续期阈值（小时）：剩余有效期大于此值则不续期
+RENEW_THRESHOLD_HOURS = 5
+
 if not EMAIL:
     raise Exception("缺少环境变量 ICEHOST_EMAIL")
 if not PASSWORD:
     raise Exception("缺少环境变量 ICEHOST_PASSWORD")
 
 
+def parse_expiry_date(page_text):
+    """
+    从页面文本中解析有效期至日期
+    支持: "有效期至：2026年6月14日 06:09:49"
+         "Expires: 2026-06-14 06:09:49"
+         "Ważność do: 2026-06-14 06:09:49"
+    返回 datetime 对象，未找到返回 None
+    """
+    patterns = [
+        r'有效期至[：:]\s*(\d{4})年(\d{1,2})月(\d{1,2})日\s*(\d{1,2}):(\d{1,2}):(\d{1,2})',
+        r'Expires?[：:]\s*(\d{4})-(\d{1,2})-(\d{1,2})\s*(\d{1,2}):(\d{1,2}):(\d{1,2})',
+        r'Ważność do[：:]\s*(\d{4})-(\d{1,2})-(\d{1,2})\s*(\d{1,2}):(\d{1,2}):(\d{1,2})',
+        r'(\d{4})-(\d{1,2})-(\d{1,2})\s+(\d{1,2}):(\d{1,2}):(\d{1,2})'  # 宽松匹配
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, page_text)
+        if match:
+            year, month, day, hour, minute, second = map(int, match.groups())
+            # 简单校验
+            if 2020 <= year <= 2030 and 1 <= month <= 12 and 1 <= day <= 31:
+                return datetime(year, month, day, hour, minute, second)
+    return None
+
+
+def get_expiry_from_page(sb):
+    """获取当前页面的有效期，重试几次"""
+    for _ in range(3):
+        page_source = sb.get_page_source()
+        expiry = parse_expiry_date(page_source)
+        if expiry:
+            return expiry
+        time.sleep(1)
+    return None
+
+
 def renew_server(sb):
-    """执行服务器续期操作 - 进入服务器详情页后点击续期，并验证是否真的成功"""
+    """执行服务器续期操作 - 进入详情页，检查有效期，必要时点击续期"""
     print("\n🔄 开始检查并续期服务器...")
     time.sleep(3)
 
+    # ---------- 1. 确保在详情页 ----------
     current_url = sb.get_current_url()
-    if "/server/" in current_url:
-        print("📍 已在服务器详情页")
-    else:
+    if "/server/" not in current_url:
         print("📍 当前在仪表盘首页，需要进入服务器详情页")
-
-        # 尝试展开服务器列表（即使找不到按钮也可能已展开）
+        # 展开服务器列表（如果按钮存在）
         try:
             show_btn = sb.find_element('//*[contains(text(), "POKAŻ MOJE SERWERY")]', timeout=3)
             if show_btn.is_displayed():
@@ -68,25 +106,23 @@ def renew_server(sb):
             print("❌ 未找到服务器条目")
             sb.save_screenshot("no_server_entry.png")
             return False
-
         time.sleep(5)
-        print(f"📍 跳转后URL: {sb.get_current_url()}")
 
-    # 当前在详情页
+    # ---------- 2. 获取当前有效期 ----------
     sb.save_screenshot("server_detail_page.png")
+    old_expiry = get_expiry_from_page(sb)
+    if old_expiry:
+        print(f"📅 当前服务器有效期至: {old_expiry.strftime('%Y-%m-%d %H:%M:%S')}")
+        remaining_hours = (old_expiry - datetime.now()).total_seconds() / 3600
+        print(f"⏳ 距离到期剩余: {remaining_hours:.2f} 小时")
+        if remaining_hours > RENEW_THRESHOLD_HOURS:
+            print(f"✅ 剩余有效期充足（>{RENEW_THRESHOLD_HOURS}小时），无需续期")
+            return True
+    else:
+        print("⚠️ 未能解析有效期，将尝试续期")
+
+    # ---------- 3. 查找并点击续期按钮 ----------
     print("🔍 查找续期按钮...")
-
-    # 先检查是否已有错误提示（比如刚续期过）
-    page_source_before = sb.get_page_source()
-    if "您不能再将服务器时间延长" in page_source_before or "cannot extend" in page_source_before.lower():
-        print("⚠️ 检测到提示：您最近已续期过，无法再次延长")
-        # 但仍尝试找按钮，若按钮存在且可点，则尝试点击（也许服务器允许）
-        # 但根据业务逻辑，大概率点完还是失败，这里直接返回成功？不，应返回失败（因为实际未延长）
-        # 但任务可能已完成（因为已经续期过），视为成功？取决于需求。这里假设只要没有真正执行延长，就算失败
-        # 为保险，继续尝试点击，如果点击后出现同样的错误，则最终失败；若意外成功则成功。
-        pass
-
-    # 续期按钮文本
     renew_texts = [
         "增加 6 小时有效期",
         "Add 6 hours",
@@ -113,65 +149,60 @@ def renew_server(sb):
                 # 处理可能的确认弹窗
                 try:
                     alert = sb.driver.switch_to.alert
-                    print(f"📢 弹窗: {alert.text}")
+                    print(f"📢 弹窗内容: {alert.text}")
                     alert.accept()
+                    print("✅ 已确认弹窗")
                 except:
+                    # 尝试自定义确认按钮
                     try:
                         confirm = sb.find_element('button:contains("确认"), button:contains("OK"), button:contains("Tak")', timeout=2)
                         confirm.click()
-                        print("✅ 确认了续期")
+                        print("✅ 点击了确认按钮")
                     except:
                         pass
                 break
         except Exception as e:
-            print(f"尝试'{text}'失败: {e}")
+            print(f"尝试文本 '{text}' 失败: {e}")
 
     if not renew_clicked:
-        print("❌ 未找到续期按钮")
+        print("❌ 未找到续期按钮，无法续期")
         sb.save_screenshot("renew_button_not_found.png")
         return False
 
-    # 等待页面更新，检查续期是否成功
+    # ---------- 4. 等待页面刷新并验证结果 ----------
+    print("⏳ 等待续期处理...")
     time.sleep(2)
     sb.refresh()
-    time.sleep(3)
+    time.sleep(5)  # 等待页面完全加载
 
-    # 检查是否出现错误提示
-    page_source_after = sb.get_page_source()
+    # 检查是否有禁止续期的错误消息
+    page_after = sb.get_page_source()
+    if "您不能再将服务器时间延长" in page_after or "cannot extend" in page_after.lower():
+        print("ℹ️ 提示：您最近已续期过，无法再次延长（视为已完成）")
+        sb.save_screenshot("already_renewed.png")
+        return True
+
+    # 获取新的有效期
+    new_expiry = get_expiry_from_page(sb)
     sb.save_screenshot("after_renew_attempt.png")
 
-    error_keywords = [
-        "您不能再将服务器时间延长",
-        "cannot extend",
-        "already extended",
-        "błąd",  # 波兰语错误
-        "nie można przedłużyć"
-    ]
-
-    success_keywords = [
-        "有效期至",
-        "Expires",
-        "nowa data ważności"
-    ]
-
-    # 判断续期是否成功
-    has_error = any(kw in page_source_after for kw in error_keywords)
-    has_success = any(kw in page_source_after for kw in success_keywords)
-
-    if has_error:
-        print("❌ 续期失败：服务器拒绝了延长请求（可能是频率限制）")
-        # 尝试提取具体错误信息
-        try:
-            error_elem = sb.find_element('//*[contains(@class, "error") or contains(@class, "alert")]', timeout=2)
-            print(f"错误详情: {error_elem.text}")
-        except:
-            pass
-        return False
-    elif has_success or "06:09:49" not in page_source_after:  # 简单判断截止日期是否有变化
-        print("✅ 续期成功！")
+    if old_expiry and new_expiry:
+        print(f"📅 新有效期至: {new_expiry.strftime('%Y-%m-%d %H:%M:%S')}")
+        if new_expiry > old_expiry:
+            print(f"✅ 续期成功！增加了 {(new_expiry - old_expiry).total_seconds() / 3600:.1f} 小时")
+            return True
+        else:
+            print("❌ 续期失败：有效期未发生变化")
+            return False
+    elif not old_expiry and new_expiry:
+        print("✅ 续期后获得有效期，可能成功")
         return True
     else:
-        print("⚠️ 续期状态不明，请检查截图")
+        print("⚠️ 无法解析有效期，请检查截图")
+        # 尝试判断是否出现其他成功标志（例如“操作成功”）
+        if "成功" in page_after or "success" in page_after.lower():
+            print("✅ 检测到成功提示，假定成功")
+            return True
         return False
 
 
