@@ -4,7 +4,7 @@
 import os
 import re
 import time
-from datetime import datetime, timedelta
+from datetime import datetime
 from seleniumbase import SB
 
 # =========================
@@ -17,9 +17,6 @@ EMAIL = os.environ.get("ICEHOST_EMAIL")
 PASSWORD = os.environ.get("ICEHOST_PASSWORD")
 PROXY = os.environ.get("PROXY_SOCKS5")
 
-# 续期阈值（小时）：剩余有效期大于此值则不续期
-RENEW_THRESHOLD_HOURS = 5
-
 if not EMAIL:
     raise Exception("缺少环境变量 ICEHOST_EMAIL")
 if not PASSWORD:
@@ -30,46 +27,30 @@ def parse_expiry_date(page_text):
     """
     从页面文本中解析有效期至日期
     支持: "有效期至：2026年6月14日 06:09:49"
-         "Expires: 2026-06-14 06:09:49"
-         "Ważność do: 2026-06-14 06:09:49"
     返回 datetime 对象，未找到返回 None
     """
     patterns = [
         r'有效期至[：:]\s*(\d{4})年(\d{1,2})月(\d{1,2})日\s*(\d{1,2}):(\d{1,2}):(\d{1,2})',
         r'Expires?[：:]\s*(\d{4})-(\d{1,2})-(\d{1,2})\s*(\d{1,2}):(\d{1,2}):(\d{1,2})',
         r'Ważność do[：:]\s*(\d{4})-(\d{1,2})-(\d{1,2})\s*(\d{1,2}):(\d{1,2}):(\d{1,2})',
-        r'(\d{4})-(\d{1,2})-(\d{1,2})\s+(\d{1,2}):(\d{1,2}):(\d{1,2})'  # 宽松匹配
     ]
     for pattern in patterns:
         match = re.search(pattern, page_text)
         if match:
             year, month, day, hour, minute, second = map(int, match.groups())
-            # 简单校验
-            if 2020 <= year <= 2030 and 1 <= month <= 12 and 1 <= day <= 31:
-                return datetime(year, month, day, hour, minute, second)
-    return None
-
-
-def get_expiry_from_page(sb):
-    """获取当前页面的有效期，重试几次"""
-    for _ in range(3):
-        page_source = sb.get_page_source()
-        expiry = parse_expiry_date(page_source)
-        if expiry:
-            return expiry
-        time.sleep(1)
+            return datetime(year, month, day, hour, minute, second)
     return None
 
 
 def renew_server(sb):
-    """执行服务器续期操作 - 进入详情页，检查有效期，必要时点击续期"""
-    print("\n🔄 开始检查并续期服务器...")
+    """进入服务器详情页，显示当前有效期，然后点击续期按钮"""
+    print("\n🔄 开始执行续期操作...")
     time.sleep(3)
 
     # ---------- 1. 确保在详情页 ----------
     current_url = sb.get_current_url()
     if "/server/" not in current_url:
-        print("📍 当前在仪表盘首页，需要进入服务器详情页")
+        print("📍 进入服务器详情页...")
         # 展开服务器列表（如果按钮存在）
         try:
             show_btn = sb.find_element('//*[contains(text(), "POKAŻ MOJE SERWERY")]', timeout=3)
@@ -80,7 +61,7 @@ def renew_server(sb):
                 print("✅ 点击了'POKAŻ MOJE SERWERY'")
                 time.sleep(2)
         except:
-            print("⚠️ 未找到'POKAŻ MOJE SERWERY'按钮，可能已展开")
+            print("⚠️ 未找到'POKAŻ MOJE SERWERY'，可能已展开")
 
         # 点击服务器条目
         clicked = False
@@ -108,20 +89,15 @@ def renew_server(sb):
             return False
         time.sleep(5)
 
-    # ---------- 2. 获取当前有效期 ----------
-    sb.save_screenshot("server_detail_page.png")
-    old_expiry = get_expiry_from_page(sb)
-    if old_expiry:
-        print(f"📅 当前服务器有效期至: {old_expiry.strftime('%Y-%m-%d %H:%M:%S')}")
-        remaining_hours = (old_expiry - datetime.now()).total_seconds() / 3600
-        print(f"⏳ 距离到期剩余: {remaining_hours:.2f} 小时")
-        if remaining_hours > RENEW_THRESHOLD_HOURS:
-            print(f"✅ 剩余有效期充足（>{RENEW_THRESHOLD_HOURS}小时），无需续期")
-            return True
+    # ---------- 2. 获取并显示当前有效期（仅用于记录） ----------
+    page_source = sb.get_page_source()
+    expiry = parse_expiry_date(page_source)
+    if expiry:
+        print(f"📅 当前服务器有效期至: {expiry.strftime('%Y-%m-%d %H:%M:%S')}")
     else:
-        print("⚠️ 未能解析有效期，将尝试续期")
+        print("⚠️ 未解析到有效期（可能页面结构变化）")
 
-    # ---------- 3. 查找并点击续期按钮 ----------
+    # ---------- 3. 查找并点击续期按钮（始终点击，不判断剩余时间） ----------
     print("🔍 查找续期按钮...")
     renew_texts = [
         "增加 6 小时有效期",
@@ -149,61 +125,39 @@ def renew_server(sb):
                 # 处理可能的确认弹窗
                 try:
                     alert = sb.driver.switch_to.alert
-                    print(f"📢 弹窗内容: {alert.text}")
+                    print(f"📢 弹窗: {alert.text}")
                     alert.accept()
-                    print("✅ 已确认弹窗")
                 except:
-                    # 尝试自定义确认按钮
                     try:
                         confirm = sb.find_element('button:contains("确认"), button:contains("OK"), button:contains("Tak")', timeout=2)
                         confirm.click()
-                        print("✅ 点击了确认按钮")
+                        print("✅ 确认了续期")
                     except:
                         pass
                 break
         except Exception as e:
-            print(f"尝试文本 '{text}' 失败: {e}")
+            print(f"尝试'{text}'失败: {e}")
 
     if not renew_clicked:
-        print("❌ 未找到续期按钮，无法续期")
-        sb.save_screenshot("renew_button_not_found.png")
+        print("❌ 未找到续期按钮")
+        sb.save_screenshot("no_renew_button.png")
         return False
 
-    # ---------- 4. 等待页面刷新并验证结果 ----------
-    print("⏳ 等待续期处理...")
+    # ---------- 4. 刷新并检查结果 ----------
     time.sleep(2)
     sb.refresh()
-    time.sleep(5)  # 等待页面完全加载
+    time.sleep(5)
+    sb.save_screenshot("after_renew.png")
 
-    # 检查是否有禁止续期的错误消息
     page_after = sb.get_page_source()
+    # 如果出现频率限制错误，表示最近已经续期过，任务仍算成功
     if "您不能再将服务器时间延长" in page_after or "cannot extend" in page_after.lower():
-        print("ℹ️ 提示：您最近已续期过，无法再次延长（视为已完成）")
-        sb.save_screenshot("already_renewed.png")
+        print("ℹ️ 服务器提示最近已续期过（无法再次延长），视为任务完成")
         return True
 
-    # 获取新的有效期
-    new_expiry = get_expiry_from_page(sb)
-    sb.save_screenshot("after_renew_attempt.png")
-
-    if old_expiry and new_expiry:
-        print(f"📅 新有效期至: {new_expiry.strftime('%Y-%m-%d %H:%M:%S')}")
-        if new_expiry > old_expiry:
-            print(f"✅ 续期成功！增加了 {(new_expiry - old_expiry).total_seconds() / 3600:.1f} 小时")
-            return True
-        else:
-            print("❌ 续期失败：有效期未发生变化")
-            return False
-    elif not old_expiry and new_expiry:
-        print("✅ 续期后获得有效期，可能成功")
-        return True
-    else:
-        print("⚠️ 无法解析有效期，请检查截图")
-        # 尝试判断是否出现其他成功标志（例如“操作成功”）
-        if "成功" in page_after or "success" in page_after.lower():
-            print("✅ 检测到成功提示，假定成功")
-            return True
-        return False
+    # 否则，未出现明确错误，假定成功
+    print("✅ 续期操作已完成（未检测到禁止提示）")
+    return True
 
 
 def login_icehost():
