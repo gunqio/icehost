@@ -24,13 +24,9 @@ if not PASSWORD:
 
 
 def parse_expiry_date(page_text):
-    """
-    从页面文本中解析有效期至日期
-    支持: "有效期至：2026年6月14日 06:09:49"
-    返回 datetime 对象，未找到返回 None
-    """
     patterns = [
         r'有效期至[：:]\s*(\d{4})年(\d{1,2})月(\d{1,2})日\s*(\d{1,2}):(\d{1,2}):(\d{1,2})',
+        r'有效期至[：:]\s*(\d{4})-(\d{1,2})-(\d{1,2})\s*(\d{1,2}):(\d{1,2}):(\d{1,2})',
         r'Expires?[：:]\s*(\d{4})-(\d{1,2})-(\d{1,2})\s*(\d{1,2}):(\d{1,2}):(\d{1,2})',
         r'Ważność do[：:]\s*(\d{4})-(\d{1,2})-(\d{1,2})\s*(\d{1,2}):(\d{1,2}):(\d{1,2})',
     ]
@@ -38,12 +34,12 @@ def parse_expiry_date(page_text):
         match = re.search(pattern, page_text)
         if match:
             year, month, day, hour, minute, second = map(int, match.groups())
-            return datetime(year, month, day, hour, minute, second)
+            if 2020 <= year <= 2030 and 1 <= month <= 12 and 1 <= day <= 31:
+                return datetime(year, month, day, hour, minute, second)
     return None
 
 
 def renew_server(sb):
-    """进入服务器详情页，显示当前有效期，然后点击续期按钮"""
     print("\n🔄 开始执行续期操作...")
     time.sleep(3)
 
@@ -51,7 +47,6 @@ def renew_server(sb):
     current_url = sb.get_current_url()
     if "/server/" not in current_url:
         print("📍 进入服务器详情页...")
-        # 展开服务器列表（如果按钮存在）
         try:
             show_btn = sb.find_element('//*[contains(text(), "POKAŻ MOJE SERWERY")]', timeout=3)
             if show_btn.is_displayed():
@@ -63,7 +58,6 @@ def renew_server(sb):
         except:
             print("⚠️ 未找到'POKAŻ MOJE SERWERY'，可能已展开")
 
-        # 点击服务器条目
         clicked = False
         server_texts = [
             "free-servers-4.icehost.pl:30159",
@@ -89,15 +83,19 @@ def renew_server(sb):
             return False
         time.sleep(5)
 
-    # ---------- 2. 获取并显示当前有效期（仅用于记录） ----------
-    page_source = sb.get_page_source()
-    expiry = parse_expiry_date(page_source)
-    if expiry:
-        print(f"📅 当前服务器有效期至: {expiry.strftime('%Y-%m-%d %H:%M:%S')}")
+    # ---------- 2. 等待有效期出现 ----------
+    print("⏳ 等待有效期信息加载...")
+    for attempt in range(10):
+        page_source = sb.get_page_source()
+        if "有效期至" in page_source or "Expires" in page_source:
+            print("✅ 有效期信息已加载")
+            break
+        time.sleep(1)
     else:
-        print("⚠️ 未解析到有效期（可能页面结构变化）")
+        print("⚠️ 未检测到有效期信息，但继续执行")
+        sb.save_screenshot("no_expiry_info.png")
 
-    # ---------- 3. 查找并点击续期按钮（始终点击，不判断剩余时间） ----------
+    # ---------- 3. 点击续期按钮 ----------
     print("🔍 查找续期按钮...")
     renew_texts = [
         "增加 6 小时有效期",
@@ -121,8 +119,6 @@ def renew_server(sb):
                 renew_clicked = True
                 print("🔘 已点击续期按钮")
                 time.sleep(3)
-
-                # 处理可能的确认弹窗
                 try:
                     alert = sb.driver.switch_to.alert
                     print(f"📢 弹窗: {alert.text}")
@@ -143,21 +139,27 @@ def renew_server(sb):
         sb.save_screenshot("no_renew_button.png")
         return False
 
-    # ---------- 4. 刷新并检查结果 ----------
-    time.sleep(2)
+    # ---------- 4. 等待并检查结果 ----------
+    print("⏳ 等待续期结果...")
+    time.sleep(3)
     sb.refresh()
     time.sleep(5)
-    sb.save_screenshot("after_renew.png")
 
     page_after = sb.get_page_source()
-    # 如果出现频率限制错误，表示最近已经续期过，任务仍算成功
-    if "您不能再将服务器时间延长" in page_after or "cannot extend" in page_after.lower():
-        print("ℹ️ 服务器提示最近已续期过（无法再次延长），视为任务完成")
-        return True
+    sb.save_screenshot("after_renew.png")
 
-    # 否则，未出现明确错误，假定成功
-    print("✅ 续期操作已完成（未检测到禁止提示）")
-    return True
+    # 检查成功信息
+    if "成功您已延长" in page_after or ("成功" in page_after and "延长" in page_after):
+        print("🎉 续期成功！服务器有效期已延长6小时")
+        return True
+    # 检查频率限制错误
+    elif "您不能再将服务器时间延长" in page_after or "cannot extend" in page_after.lower():
+        print("ℹ️ 服务器提示最近已续期过，无需再次延长（视为成功）")
+        return True
+    else:
+        print("⚠️ 未检测到成功或禁止提示，续期可能未生效")
+        # 还可以尝试对比有效期，但为了简便，返回失败以便人工介入
+        return False
 
 
 def login_icehost():
@@ -186,7 +188,6 @@ def login_icehost():
         sb.save_screenshot("login_page.png")
 
         print("📝 填写账号密码...")
-        # 邮箱/用户名
         email_selectors = [
             'input[name="email"]', 'input[name="username"]',
             'input[type="email"]', 'input[placeholder*="mail" i]',
@@ -207,7 +208,6 @@ def login_icehost():
             sb.type(sb.find_element('input'), EMAIL)
             print("✅ 使用第一个输入框")
 
-        # 密码
         pwd_selectors = [
             'input[type="password"]', 'input[name="password"]',
             'input[placeholder*="hasło" i]'
@@ -250,7 +250,6 @@ def login_icehost():
         print("⏳ 等待登录...")
         time.sleep(8)
 
-        # 判断登录成功
         page_source = sb.get_page_source()
         current_url = sb.get_current_url()
         print(f"📍 当前页面: {current_url}")
