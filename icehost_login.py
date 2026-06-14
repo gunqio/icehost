@@ -43,7 +43,7 @@ def renew_server(sb):
     print("\n🔄 开始执行续期操作...")
     time.sleep(3)
 
-    # ---------- 1. 确保在详情页 ----------
+    # ---------- 1. 确保在服务器详情页 ----------
     current_url = sb.get_current_url()
     if "/server/" not in current_url:
         print("📍 进入服务器详情页...")
@@ -83,19 +83,20 @@ def renew_server(sb):
             return False
         time.sleep(5)
 
-    # ---------- 2. 等待有效期出现 ----------
-    print("⏳ 等待有效期信息加载...")
+    # ---------- 2. 获取当前有效期（用于对比）----------
+    print("⏳ 获取当前有效期...")
+    expiry_old = None
     for attempt in range(10):
         page_source = sb.get_page_source()
-        if "有效期至" in page_source or "Expires" in page_source:
-            print("✅ 有效期信息已加载")
+        expiry_old = parse_expiry_date(page_source)
+        if expiry_old:
+            print(f"📅 当前有效期: {expiry_old.strftime('%Y-%m-%d %H:%M:%S')}")
             break
         time.sleep(1)
-    else:
-        print("⚠️ 未检测到有效期信息，但继续执行")
-        sb.save_screenshot("no_expiry_info.png")
+    if not expiry_old:
+        print("⚠️ 未能解析当前有效期，继续尝试续期")
 
-    # ---------- 3. 点击续期按钮 ----------
+    # ---------- 3. 查找并点击续期按钮 ----------
     print("🔍 查找续期按钮...")
     renew_texts = [
         "增加 6 小时有效期",
@@ -119,6 +120,8 @@ def renew_server(sb):
                 renew_clicked = True
                 print("🔘 已点击续期按钮")
                 time.sleep(3)
+
+                # 处理可能的确认弹窗
                 try:
                     alert = sb.driver.switch_to.alert
                     print(f"📢 弹窗: {alert.text}")
@@ -139,26 +142,49 @@ def renew_server(sb):
         sb.save_screenshot("no_renew_button.png")
         return False
 
-    # ---------- 4. 等待并检查结果 ----------
-    print("⏳ 等待续期结果...")
-    time.sleep(3)
+    # ---------- 4. 关键改进：等待并检查明确的成功/禁止提示 ----------
+    print("⏳ 等待服务器响应（5秒）...")
+    time.sleep(5)
+    current_source = sb.get_page_source()
+    sb.save_screenshot("after_click.png")
+
+    # 检查成功提示（最重要）
+    if "成功您已延长" in current_source or "成功您已延长服务器的有效期" in current_source:
+        print("🎉 续期成功！检测到成功提示")
+        return True
+
+    # 检查禁止续期错误
+    if "您不能再将服务器时间延长" in current_source or "cannot extend" in current_source.lower():
+        print("ℹ️ 服务器提示：最近已续期过，无法再次延长（视为成功）")
+        return True
+
+    # 如果没有明确提示，再刷新页面并对比有效期
+    print("🔄 未检测到明确提示，刷新页面验证有效期...")
     sb.refresh()
     time.sleep(5)
-
-    page_after = sb.get_page_source()
     sb.save_screenshot("after_renew.png")
+    page_after = sb.get_page_source()
 
-    # 检查成功信息
-    if "成功您已延长" in page_after or ("成功" in page_after and "延长" in page_after):
-        print("🎉 续期成功！服务器有效期已延长6小时")
+    # 再次检查成功提示（刷新后可能仍然存在）
+    if "成功您已延长" in page_after:
+        print("🎉 刷新后检测到成功提示，续期成功")
         return True
-    # 检查频率限制错误
-    elif "您不能再将服务器时间延长" in page_after or "cannot extend" in page_after.lower():
-        print("ℹ️ 服务器提示最近已续期过，无需再次延长（视为成功）")
+    if "您不能再将服务器时间延长" in page_after:
+        print("ℹ️ 刷新后检测到禁止提示，已续期过")
         return True
+
+    # 对比有效期
+    expiry_new = parse_expiry_date(page_after)
+    if expiry_new:
+        print(f"📅 新有效期: {expiry_new.strftime('%Y-%m-%d %H:%M:%S')}")
+    if expiry_old and expiry_new and expiry_new > expiry_old:
+        print(f"✅ 续期成功！有效期从 {expiry_old} 增加到 {expiry_new}")
+        return True
+    elif expiry_old and expiry_new and expiry_new == expiry_old:
+        print("❌ 续期失败：有效期未发生变化")
+        return False
     else:
-        print("⚠️ 未检测到成功或禁止提示，续期可能未生效")
-        # 还可以尝试对比有效期，但为了简便，返回失败以便人工介入
+        print("⚠️ 无法确定续期结果，续期可能未生效")
         return False
 
 
