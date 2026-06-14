@@ -24,11 +24,16 @@ if not PASSWORD:
 
 
 def parse_expiry_date(page_text):
+    """解析有效期，支持多种格式"""
     patterns = [
+        # 中文格式
         r'有效期至[：:]\s*(\d{4})年(\d{1,2})月(\d{1,2})日\s*(\d{1,2}):(\d{1,2}):(\d{1,2})',
         r'有效期至[：:]\s*(\d{4})-(\d{1,2})-(\d{1,2})\s*(\d{1,2}):(\d{1,2}):(\d{1,2})',
+        # 英文/波兰语 "DATA WAŻNOŚCI: 2026-06-14 12:09:49"
+        r'DATA WAŻNOŚCI[：:]\s*(\d{4})-(\d{1,2})-(\d{1,2})\s*(\d{1,2}):(\d{1,2}):(\d{1,2})',
         r'Expires?[：:]\s*(\d{4})-(\d{1,2})-(\d{1,2})\s*(\d{1,2}):(\d{1,2}):(\d{1,2})',
-        r'Ważność do[：:]\s*(\d{4})-(\d{1,2})-(\d{1,2})\s*(\d{1,2}):(\d{1,2}):(\d{1,2})',
+        # 通用日期时间格式
+        r'(\d{4})-(\d{1,2})-(\d{1,2})\s+(\d{1,2}):(\d{1,2}):(\d{1,2})',
     ]
     for pattern in patterns:
         match = re.search(pattern, page_text)
@@ -83,7 +88,7 @@ def renew_server(sb):
             return False
         time.sleep(5)
 
-    # ---------- 2. 获取当前有效期（用于对比）----------
+    # ---------- 2. 获取当前有效期 ----------
     print("⏳ 获取当前有效期...")
     expiry_old = None
     for attempt in range(10):
@@ -99,9 +104,9 @@ def renew_server(sb):
     # ---------- 3. 查找并点击续期按钮 ----------
     print("🔍 查找续期按钮...")
     renew_texts = [
+        "Dodaj 6 godzin",
         "增加 6 小时有效期",
         "Add 6 hours",
-        "Dodaj 6 godzin",
         "Przedłuż o 6 godzin",
         "+6 godzin",
         "Extend by 6 hours"
@@ -142,36 +147,52 @@ def renew_server(sb):
         sb.save_screenshot("no_renew_button.png")
         return False
 
-    # ---------- 4. 关键改进：等待并检查明确的成功/禁止提示 ----------
+    # ---------- 4. 检查结果（重点：波兰语错误提示）----------
     print("⏳ 等待服务器响应（5秒）...")
     time.sleep(5)
     current_source = sb.get_page_source()
     sb.save_screenshot("after_click.png")
 
-    # 检查成功提示（最重要）
-    if "成功您已延长" in current_source or "成功您已延长服务器的有效期" in current_source:
-        print("🎉 续期成功！检测到成功提示")
-        return True
+    # 成功提示（中文和波兰语）
+    success_patterns = [
+        "成功您已延长",
+        "成功您已延长服务器的有效期",
+        "przedłużyłeś",  # 波兰语 "你已延长"
+        "przedłużono",   # 已延长
+    ]
+    for pattern in success_patterns:
+        if pattern in current_source:
+            print(f"🎉 续期成功！检测到成功提示: {pattern}")
+            return True
 
-    # 检查禁止续期错误
-    if "您不能再将服务器时间延长" in current_source or "cannot extend" in current_source.lower():
-        print("ℹ️ 服务器提示：最近已续期过，无法再次延长（视为成功）")
-        return True
+    # 禁止续期错误（波兰语、中文、英文）
+    error_patterns = [
+        "Nie możesz przedłużyć serwera o kolejne 6 godziny",
+        "您不能再将服务器时间延长",
+        "cannot extend",
+        "niedawno to zrobiłeś",
+    ]
+    for pattern in error_patterns:
+        if pattern in current_source:
+            print(f"ℹ️ 检测到禁止续期提示: {pattern}（视为成功，因为已续期过）")
+            return True
 
-    # 如果没有明确提示，再刷新页面并对比有效期
-    print("🔄 未检测到明确提示，刷新页面验证有效期...")
+    # 如果没有明确提示，刷新页面再尝试
+    print("🔄 未检测到明确提示，刷新页面验证...")
     sb.refresh()
     time.sleep(5)
     sb.save_screenshot("after_renew.png")
     page_after = sb.get_page_source()
 
-    # 再次检查成功提示（刷新后可能仍然存在）
-    if "成功您已延长" in page_after:
-        print("🎉 刷新后检测到成功提示，续期成功")
-        return True
-    if "您不能再将服务器时间延长" in page_after:
-        print("ℹ️ 刷新后检测到禁止提示，已续期过")
-        return True
+    # 再次检查成功/错误
+    for pattern in success_patterns:
+        if pattern in page_after:
+            print(f"🎉 刷新后检测到成功提示: {pattern}")
+            return True
+    for pattern in error_patterns:
+        if pattern in page_after:
+            print(f"ℹ️ 刷新后检测到禁止提示: {pattern}")
+            return True
 
     # 对比有效期
     expiry_new = parse_expiry_date(page_after)
