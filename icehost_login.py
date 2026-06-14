@@ -1,364 +1,280 @@
-name: IceHost
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 
-on:
-  workflow_dispatch:
-  schedule:
-    - cron: '0 */4 * * *'   # 每4小时运行一次 (UTC时间0,4,8,12,16,20点)
+import os
+import re
+import time
+from datetime import datetime
+from seleniumbase import SB
 
-jobs:
-  run-task:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
+# =========================
+# 配置
+# =========================
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
+LOGIN_URL = "https://dash.icehost.pl/auth/login"
 
-      - name: Install Dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y xvfb xdotool unzip google-chrome-stable
-          pip install seleniumbase pyvirtualdisplay requests
+EMAIL = os.environ.get("ICEHOST_EMAIL")
+PASSWORD = os.environ.get("ICEHOST_PASSWORD")
+PROXY = os.environ.get("PROXY_SOCKS5")
 
-      - name: 安装依赖
-        run: |
-          sudo apt-get update && sudo apt-get install -y xvfb unzip
-          pip install seleniumbase>=4.25.0 pyvirtualdisplay>=3.0 requests>=2.31.0
+if not EMAIL:
+    raise Exception("缺少环境变量 ICEHOST_EMAIL")
+if not PASSWORD:
+    raise Exception("缺少环境变量 ICEHOST_PASSWORD")
 
-      - name: 安装并启动代理
-        env:
-          PROXY_NODE: ${{ secrets.PROXY_NODE }}
-        run: |
-          if [ -z "$PROXY_NODE" ]; then
-            echo "[INFO] 未配置代理，直连模式"
-            exit 0
-          fi
-          
-          wget -q https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip
-          unzip -q Xray-linux-64.zip -d xray && chmod +x xray/xray
-          
-          python3 << 'PYEOF'
-          import os, sys, json, base64
-          from urllib.parse import parse_qs, unquote, urlparse
 
-          def mask(s):
-              return f"{s[:2]}***{s[-2:]}" if len(s) > 4 else "****"
+def parse_expiry_date(page_text):
+    """
+    从页面文本中解析有效期至日期
+    支持: "有效期至：2026年6月14日 06:09:49"
+    返回 datetime 对象，未找到返回 None
+    """
+    patterns = [
+        r'有效期至[：:]\s*(\d{4})年(\d{1,2})月(\d{1,2})日\s*(\d{1,2}):(\d{1,2}):(\d{1,2})',
+        r'Expires?[：:]\s*(\d{4})-(\d{1,2})-(\d{1,2})\s*(\d{1,2}):(\d{1,2}):(\d{1,2})',
+        r'Ważność do[：:]\s*(\d{4})-(\d{1,2})-(\d{1,2})\s*(\d{1,2}):(\d{1,2}):(\d{1,2})',
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, page_text)
+        if match:
+            year, month, day, hour, minute, second = map(int, match.groups())
+            return datetime(year, month, day, hour, minute, second)
+    return None
 
-          url = os.environ.get("PROXY_NODE", "").strip()
-          if not url:
-              print("[ERROR] PROXY_NODE 为空")
-              sys.exit(1)
 
-          # 解析协议
-          if url.startswith("vless://"):
-              protocol = "vless"
-              content = url[8:]
-          elif url.startswith("vmess://"):
-              protocol = "vmess"
-              content = url[8:]
-          elif url.startswith("trojan://"):
-              protocol = "trojan"
-              content = url[9:]
-          elif url.startswith("ss://"):
-              protocol = "ss"
-              content = url[5:]
-          elif url.startswith("socks5://") or url.startswith("socks://"):
-              protocol = "socks5"
-              # 直接使用外部 SOCKS5
-              content = url.split("://")[1].split("#")[0]
-              if "@" in content:
-                  server = content.split("@")[1].split(":")[0]
-              else:
-                  server = content.split(":")[0]
-              print(f"[INFO] SOCKS5 -> {mask(server)}")
-              with open("use_external_socks.txt", "w") as f:
-                  f.write(url.split("#")[0])
-              sys.exit(0)
-          else:
-              print(f"[ERROR] 不支持的协议: {url.split('://')[0]}")
-              sys.exit(1)
+def renew_server(sb):
+    """进入服务器详情页，显示当前有效期，然后点击续期按钮"""
+    print("\n🔄 开始执行续期操作...")
+    time.sleep(3)
 
-          # 去除备注
-          if "#" in content:
-              content = content.rsplit("#", 1)[0]
+    # ---------- 1. 确保在详情页 ----------
+    current_url = sb.get_current_url()
+    if "/server/" not in current_url:
+        print("📍 进入服务器详情页...")
+        # 展开服务器列表（如果按钮存在）
+        try:
+            show_btn = sb.find_element('//*[contains(text(), "POKAŻ MOJE SERWERY")]', timeout=3)
+            if show_btn.is_displayed():
+                sb.execute_script("arguments[0].scrollIntoView(true);", show_btn)
+                time.sleep(0.5)
+                show_btn.click()
+                print("✅ 点击了'POKAŻ MOJE SERWERY'")
+                time.sleep(2)
+        except:
+            print("⚠️ 未找到'POKAŻ MOJE SERWERY'，可能已展开")
 
-          config = {
-              "log": {"loglevel": "warning"},
-              "inbounds": [
-                  {"port": 10808, "listen": "127.0.0.1", "protocol": "socks", "settings": {"udp": True}},
-                  {"port": 10809, "listen": "127.0.0.1", "protocol": "http"}
-              ],
-              "outbounds": []
-          }
+        # 点击服务器条目
+        clicked = False
+        server_texts = [
+            "free-servers-4.icehost.pl:30159",
+            "free-servers-4.icehost.pl",
+            "Amelie Serwer testowy"
+        ]
+        for text in server_texts:
+            try:
+                elem = sb.find_element(f'//*[contains(text(), "{text}")]', timeout=3)
+                if elem:
+                    sb.execute_script("arguments[0].scrollIntoView(true);", elem)
+                    time.sleep(0.5)
+                    elem.click()
+                    clicked = True
+                    print(f"✅ 点击服务器条目: {text}")
+                    break
+            except:
+                continue
 
-          if protocol == "vless":
-              # vless://uuid@server:port?params
-              uuid, rest = content.split("@", 1)
-              if "?" in rest:
-                  host_port, params_str = rest.split("?", 1)
-              else:
-                  host_port, params_str = rest, ""
-              
-              if ":" in host_port:
-                  address, port = host_port.rsplit(":", 1)
-              else:
-                  address, port = host_port, "443"
-              
-              params = parse_qs(params_str)
-              security = params.get("security", ["none"])[0]
-              network = params.get("type", ["tcp"])[0]
-              sni = params.get("sni", [address])[0]
-              fp = params.get("fp", ["chrome"])[0]
-              flow = params.get("flow", [""])[0]
-              pbk = params.get("pbk", [""])[0]
-              host = params.get("host", [sni])[0]
-              path = unquote(params.get("path", ["/"])[0])
-              
-              print(f"[INFO] VLESS -> {mask(address)}:{port} (security: {security}, network: {network})")
-              
-              outbound = {
-                  "protocol": "vless",
-                  "settings": {
-                      "vnext": [{
-                          "address": address,
-                          "port": int(port),
-                          "users": [{"id": uuid, "encryption": "none"}]
-                      }]
-                  },
-                  "streamSettings": {
-                      "network": network,
-                      "security": security
-                  }
-              }
-              
-              # 添加 flow
-              if flow:
-                  outbound["settings"]["vnext"][0]["users"][0]["flow"] = flow
-              
-              # Reality 设置
-              if security == "reality":
-                  outbound["streamSettings"]["realitySettings"] = {
-                      "serverName": sni,
-                      "fingerprint": fp,
-                      "publicKey": pbk
-                  }
-              # TLS 设置
-              elif security == "tls":
-                  outbound["streamSettings"]["tlsSettings"] = {
-                      "serverName": sni,
-                      "fingerprint": fp,
-                      "allowInsecure": False
-                  }
-              
-              # WebSocket 设置
-              if network == "ws":
-                  outbound["streamSettings"]["wsSettings"] = {
-                      "path": path,
-                      "headers": {"Host": host}
-                  }
-              # gRPC 设置
-              elif network == "grpc":
-                  service_name = params.get("serviceName", [""])[0]
-                  outbound["streamSettings"]["grpcSettings"] = {
-                      "serviceName": service_name
-                  }
-              
-              config["outbounds"].append(outbound)
+        if not clicked:
+            print("❌ 未找到服务器条目")
+            sb.save_screenshot("no_server_entry.png")
+            return False
+        time.sleep(5)
 
-          elif protocol == "vmess":
-              # vmess://base64
-              try:
-                  # 处理 URL 安全的 base64
-                  padding = 4 - len(content) % 4
-                  if padding != 4:
-                      content += "=" * padding
-                  decoded = base64.b64decode(content).decode("utf-8")
-                  vm = json.loads(decoded)
-              except Exception as e:
-                  print(f"[ERROR] VMess 解析失败: {e}")
-                  sys.exit(1)
-              
-              address = vm.get("add", "")
-              port = int(vm.get("port", 443))
-              uuid = vm.get("id", "")
-              aid = int(vm.get("aid", 0))
-              network = vm.get("net", "tcp")
-              tls = vm.get("tls", "")
-              sni = vm.get("sni", "") or vm.get("host", address)
-              host = vm.get("host", address)
-              path = vm.get("path", "/")
-              fp = vm.get("fp", "chrome")
-              
-              print(f"[INFO] VMess -> {mask(address)}:{port} (network: {network}, tls: {tls})")
-              
-              outbound = {
-                  "protocol": "vmess",
-                  "settings": {
-                      "vnext": [{
-                          "address": address,
-                          "port": port,
-                          "users": [{"id": uuid, "alterId": aid, "security": "auto"}]
-                      }]
-                  },
-                  "streamSettings": {
-                      "network": network,
-                      "security": "tls" if tls == "tls" else "none"
-                  }
-              }
-              
-              if tls == "tls":
-                  outbound["streamSettings"]["tlsSettings"] = {
-                      "serverName": sni,
-                      "fingerprint": fp,
-                      "allowInsecure": False
-                  }
-              
-              if network == "ws":
-                  outbound["streamSettings"]["wsSettings"] = {
-                      "path": path,
-                      "headers": {"Host": host}
-                  }
-              
-              config["outbounds"].append(outbound)
+    # ---------- 2. 获取并显示当前有效期（仅用于记录） ----------
+    page_source = sb.get_page_source()
+    expiry = parse_expiry_date(page_source)
+    if expiry:
+        print(f"📅 当前服务器有效期至: {expiry.strftime('%Y-%m-%d %H:%M:%S')}")
+    else:
+        print("⚠️ 未解析到有效期（可能页面结构变化）")
 
-          elif protocol == "trojan":
-              # trojan://password@server:port?params
-              password, rest = content.split("@", 1)
-              if "?" in rest:
-                  host_port, params_str = rest.split("?", 1)
-              else:
-                  host_port, params_str = rest, ""
-              
-              if ":" in host_port:
-                  address, port = host_port.rsplit(":", 1)
-              else:
-                  address, port = host_port, "443"
-              
-              params = parse_qs(params_str)
-              sni = params.get("sni", [address])[0]
-              network = params.get("type", ["tcp"])[0]
-              host = params.get("host", [sni])[0]
-              path = unquote(params.get("path", ["/"])[0])
-              fp = params.get("fp", ["chrome"])[0]
-              
-              print(f"[INFO] Trojan -> {mask(address)}:{port} (network: {network})")
-              
-              outbound = {
-                  "protocol": "trojan",
-                  "settings": {
-                      "servers": [{
-                          "address": address,
-                          "port": int(port),
-                          "password": password
-                      }]
-                  },
-                  "streamSettings": {
-                      "network": network,
-                      "security": "tls",
-                      "tlsSettings": {
-                          "serverName": sni,
-                          "fingerprint": fp,
-                          "allowInsecure": False
-                      }
-                  }
-              }
-              
-              if network == "ws":
-                  outbound["streamSettings"]["wsSettings"] = {
-                      "path": path,
-                      "headers": {"Host": host}
-                  }
-              
-              config["outbounds"].append(outbound)
+    # ---------- 3. 查找并点击续期按钮（始终点击，不判断剩余时间） ----------
+    print("🔍 查找续期按钮...")
+    renew_texts = [
+        "增加 6 小时有效期",
+        "Add 6 hours",
+        "Dodaj 6 godzin",
+        "Przedłuż o 6 godzin",
+        "+6 godzin",
+        "Extend by 6 hours"
+    ]
 
-          elif protocol == "ss":
-              # ss://base64@server:port 或 ss://base64#name
-              try:
-                  if "@" in content:
-                      # 新格式: base64(method:password)@server:port
-                      encoded, server_part = content.split("@", 1)
-                      decoded = base64.b64decode(encoded + "==").decode("utf-8")
-                      method, password = decoded.split(":", 1)
-                      address, port = server_part.split(":", 1)
-                  else:
-                      # 旧格式: base64(method:password@server:port)
-                      decoded = base64.b64decode(content + "==").decode("utf-8")
-                      if "@" in decoded:
-                          user_part, server_part = decoded.split("@", 1)
-                          method, password = user_part.split(":", 1)
-                          address, port = server_part.split(":", 1)
-                      else:
-                          raise ValueError("无法解析")
-              except Exception as e:
-                  print(f"[ERROR] Shadowsocks 解析失败: {e}")
-                  sys.exit(1)
-              
-              print(f"[INFO] Shadowsocks -> {mask(address)}:{port}")
-              
-              outbound = {
-                  "protocol": "shadowsocks",
-                  "settings": {
-                      "servers": [{
-                          "address": address,
-                          "port": int(port),
-                          "method": method,
-                          "password": password
-                      }]
-                  }
-              }
-              
-              config["outbounds"].append(outbound)
+    renew_clicked = False
+    for text in renew_texts:
+        try:
+            xpath = f'//*[contains(text(), "{text}")]'
+            elements = sb.find_elements(xpath)
+            if elements:
+                print(f"✅ 找到续期按钮: {text}")
+                sb.execute_script("arguments[0].scrollIntoView(true);", elements[0])
+                time.sleep(1)
+                elements[0].click()
+                renew_clicked = True
+                print("🔘 已点击续期按钮")
+                time.sleep(3)
 
-          # 保存配置
-          with open("xray_config.json", "w") as f:
-              json.dump(config, f, indent=2)
-          
-          print("[INFO] ✅ 代理配置已生成")
-          PYEOF
-          
-          # 检查是否使用外部 SOCKS5
-          if [ -f "use_external_socks.txt" ]; then
-            EXTERNAL_SOCKS=$(cat use_external_socks.txt)
-            echo "PROXY_SOCKS5=$EXTERNAL_SOCKS" >> $GITHUB_ENV
-            echo "[INFO] ✅ 使用外部 SOCKS5 代理"
-            exit 0
-          fi
-          
-          # 启动 Xray
-          ./xray/xray run -c xray_config.json > xray.log 2>&1 &
-          sleep 5
-          
-          # 测试代理
-          echo "[INFO] 测试代理连接..."
-          for i in 1 2 3 4 5; do
-            if curl -x socks5://127.0.0.1:10808 -s --max-time 15 https://api.ipify.org > /dev/null 2>&1; then
-              echo "[INFO] ✅ 代理连接成功"
-              echo "PROXY_SOCKS5=socks5://127.0.0.1:10808" >> $GITHUB_ENV
-              exit 0
-            fi
-            echo "[WARN] 尝试 $i/5..."
-            sleep 3
-          done
-          
-          echo "[ERROR] ❌ 代理连接失败"
-          echo "--- Xray 日志 ---"
-          cat xray.log
-          exit 1
+                # 处理可能的确认弹窗
+                try:
+                    alert = sb.driver.switch_to.alert
+                    print(f"📢 弹窗: {alert.text}")
+                    alert.accept()
+                except:
+                    try:
+                        confirm = sb.find_element('button:contains("确认"), button:contains("OK"), button:contains("Tak")', timeout=2)
+                        confirm.click()
+                        print("✅ 确认了续期")
+                    except:
+                        pass
+                break
+        except Exception as e:
+            print(f"尝试'{text}'失败: {e}")
 
-      - name: 执行自动化登录
-        env:
-          ICEHOST_EMAIL: ${{ secrets.ICEHOST_EMAIL }}
-          ICEHOST_PASSWORD: ${{ secrets.ICEHOST_PASSWORD }}
-          PROXY_SOCKS5: ${{ env.PROXY_SOCKS5 }}
-        run: |
-          # 必须使用 1920x1080 确保验证码方框位置符合脚本预期
-          xvfb-run --server-args="-screen 0 1920x1080x24" python3 icehost_login.py
+    if not renew_clicked:
+        print("❌ 未找到续期按钮")
+        sb.save_screenshot("no_renew_button.png")
+        return False
 
-      - name: Upload Artifacts
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: icehost-debug
-          path: "*.png"
+    # ---------- 4. 刷新并检查结果 ----------
+    time.sleep(2)
+    sb.refresh()
+    time.sleep(5)
+    sb.save_screenshot("after_renew.png")
+
+    page_after = sb.get_page_source()
+    # 如果出现频率限制错误，表示最近已经续期过，任务仍算成功
+    if "您不能再将服务器时间延长" in page_after or "cannot extend" in page_after.lower():
+        print("ℹ️ 服务器提示最近已续期过（无法再次延长），视为任务完成")
+        return True
+
+    # 否则，未出现明确错误，假定成功
+    print("✅ 续期操作已完成（未检测到禁止提示）")
+    return True
+
+
+def login_icehost():
+    options = {
+        "uc": True,
+        "headless2": True,
+        "headless": True,
+        "agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/137.0.0.0 Safari/537.36"
+        ),
+    }
+    if PROXY:
+        print(f"🌐 使用代理: {PROXY}")
+        options["proxy"] = PROXY
+
+    print("🚀 启动浏览器...")
+    with SB(**options) as sb:
+        print("🚀 打开 IceHost 登录页...")
+        try:
+            sb.uc_open_with_reconnect(LOGIN_URL, 5)
+        except:
+            sb.open(LOGIN_URL)
+        time.sleep(5)
+        sb.save_screenshot("login_page.png")
+
+        print("📝 填写账号密码...")
+        # 邮箱/用户名
+        email_selectors = [
+            'input[name="email"]', 'input[name="username"]',
+            'input[type="email"]', 'input[placeholder*="mail" i]',
+            'input[placeholder*="email" i]', 'input[placeholder*="Adres" i]',
+            'input[type="text"]', 'input:first-of-type'
+        ]
+        email_ok = False
+        for sel in email_selectors:
+            try:
+                if sb.is_element_visible(sel):
+                    sb.type(sel, EMAIL)
+                    email_ok = True
+                    print(f"✅ 找到邮箱框: {sel}")
+                    break
+            except:
+                pass
+        if not email_ok:
+            sb.type(sb.find_element('input'), EMAIL)
+            print("✅ 使用第一个输入框")
+
+        # 密码
+        pwd_selectors = [
+            'input[type="password"]', 'input[name="password"]',
+            'input[placeholder*="hasło" i]'
+        ]
+        pwd_ok = False
+        for sel in pwd_selectors:
+            try:
+                if sb.is_element_visible(sel):
+                    sb.type(sel, PASSWORD)
+                    pwd_ok = True
+                    print(f"✅ 找到密码框: {sel}")
+                    break
+            except:
+                pass
+        if not pwd_ok:
+            sb.type(sb.find_elements('input')[1], PASSWORD)
+            print("✅ 使用第二个输入框")
+
+        print("🔐 提交登录...")
+        btn_selectors = [
+            'button[type="submit"]',
+            'button:contains("Załoguj się")',
+            'button:contains("Login")',
+            'button'
+        ]
+        clicked = False
+        for sel in btn_selectors:
+            try:
+                if sb.is_element_visible(sel):
+                    sb.click(sel)
+                    clicked = True
+                    print(f"✅ 点击登录按钮: {sel}")
+                    break
+            except:
+                pass
+        if not clicked:
+            sb.press_enter('input[type="password"]')
+            print("✅ 使用回车提交")
+
+        print("⏳ 等待登录...")
+        time.sleep(8)
+
+        # 判断登录成功
+        page_source = sb.get_page_source()
+        current_url = sb.get_current_url()
+        print(f"📍 当前页面: {current_url}")
+
+        success_keywords = ["Serwery", "账户余额", "服务器", "Konto", "余额"]
+        login_ok = any(kw in page_source for kw in success_keywords) or ("/auth/login" not in current_url)
+
+        sb.save_screenshot("after_login.png")
+        if not login_ok:
+            print("❌ 登录失败")
+            with open("login_failed.html", "w", encoding="utf-8") as f:
+                f.write(page_source)
+            return False
+
+        print("🎉 登录成功！")
+        return renew_server(sb)
+
+
+if __name__ == "__main__":
+    try:
+        result = login_icehost()
+        exit(0 if result else 1)
+    except Exception as e:
+        print(f"❌ 异常: {e}")
+        import traceback
+        traceback.print_exc()
+        exit(1)
