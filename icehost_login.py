@@ -1,190 +1,364 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-Lumix 自动续期脚本
-根据实际日志重构：
-- 最多续期 3 次，每次增加 1 天，上限 14 天
-- 代理模式、TG 通知、出口 IP 验证
-"""
+name: IceHost
 
-import os
-import sys
-import time
-import requests
-from datetime import datetime
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 */4 * * *'   # 每4小时运行一次 (UTC时间0,4,8,12,16,20点)
 
-# ======================== 配置（环境变量）========================
-LUMIX_COOKIE = os.getenv("LUMIX_COOKIE")
-GOST_PROXY = os.getenv("GOST_PROXY")      # 非空即启用代理模式
-TG_BOT = os.getenv("TG_BOT")              # 格式 "token:chat_id" 或 "token,chat_id"
+jobs:
+  run-task:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
 
-# 业务常量
-MAX_DAYS = 14          # 服务器最大天数限制
-MAX_RENEW_ATTEMPTS = 3 # 最多续期次数（与日志中的3次对应）
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
 
-# 代理配置（工作流中已启动本地 GOST，监听 127.0.0.1:8080）
-PROXIES = None
-if GOST_PROXY:
-    PROXIES = {"http": "http://127.0.0.1:8080", "https": "http://127.0.0.1:8080"}
-    print("🛡️ 使用代理模式")
-else:
-    print("🌐 直连模式")
+      - name: Install Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb xdotool unzip google-chrome-stable
+          pip install seleniumbase pyvirtualdisplay requests
 
-# ======================== 辅助函数 ================================
-def log(msg):
-    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}")
+      - name: 安装依赖
+        run: |
+          sudo apt-get update && sudo apt-get install -y xvfb unzip
+          pip install seleniumbase>=4.25.0 pyvirtualdisplay>=3.0 requests>=2.31.0
 
-def tg_send(message):
-    """发送 Telegram 通知（如果配置了）"""
-    if not TG_BOT:
-        return
-    try:
-        # 分离 token 和 chat_id
-        if ':' in TG_BOT:
-            token, chat_id = TG_BOT.split(':', 1)
-        elif ',' in TG_BOT:
-            token, chat_id = TG_BOT.split(',', 1)
-        else:
-            return
-        url = f"https://api.telegram.org/bot{token}/sendMessage"
-        requests.post(url, data={"chat_id": chat_id, "text": message}, timeout=5)
-        print("📨 TG 推送成功")
-    except Exception as e:
-        print(f"❌ TG 推送失败: {e}")
+      - name: 安装并启动代理
+        env:
+          PROXY_NODE: ${{ secrets.PROXY_NODE }}
+        run: |
+          if [ -z "$PROXY_NODE" ]; then
+            echo "[INFO] 未配置代理，直连模式"
+            exit 0
+          fi
+          
+          wget -q https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip
+          unzip -q Xray-linux-64.zip -d xray && chmod +x xray/xray
+          
+          python3 << 'PYEOF'
+          import os, sys, json, base64
+          from urllib.parse import parse_qs, unquote, urlparse
 
-def verify_ip():
-    """验证出口 IP，输出掩码格式"""
-    try:
-        resp = requests.get("https://api.ipify.org", proxies=PROXIES, timeout=10)
-        ip = resp.text.strip()
-        # 掩码最后一段（兼容 IPv4）
-        parts = ip.split('.')
-        if len(parts) == 4:
-            masked = f"{parts[0]}.{parts[1]}.{parts[2]}.**"
-        else:
-            masked = ip[:8] + "**"
-        print(f"✅ 出口 IP 确认：{masked}")
-        return True
-    except Exception as e:
-        print(f"❌ 出口 IP 验证失败: {e}")
-        return False
+          def mask(s):
+              return f"{s[:2]}***{s[-2:]}" if len(s) > 4 else "****"
 
-# ======================== API 接口（需根据实际服务修改）===============
-def get_server_status():
-    """
-    获取服务器状态和剩余天数
-    返回: (status, days_left)
-    """
-    # 示例接口，请替换为实际 URL
-    url = "https://www.lumixgame.com/api/server/status"
-    headers = {
-        "Cookie": LUMIX_COOKIE,
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-    }
-    try:
-        resp = requests.get(url, headers=headers, proxies=PROXIES, timeout=15)
-        data = resp.json()
-        # 假设返回格式: {"code":0, "data":{"status":"starting", "expire_days":11}}
-        if data.get("code") == 0:
-            info = data.get("data", {})
-            return info.get("status"), info.get("expire_days")
-        else:
-            print(f"❌ API 返回错误: {data}")
-            return None, None
-    except Exception as e:
-        print(f"❌ 获取状态失败: {e}")
-        return None, None
+          url = os.environ.get("PROXY_NODE", "").strip()
+          if not url:
+              print("[ERROR] PROXY_NODE 为空")
+              sys.exit(1)
 
-def perform_renew():
-    """
-    执行一次续期请求
-    返回新的剩余天数，失败返回 None
-    """
-    url = "https://www.lumixgame.com/api/server/renew"
-    headers = {"Cookie": LUMIX_COOKIE, "User-Agent": "Mozilla/5.0"}
-    try:
-        resp = requests.post(url, headers=headers, proxies=PROXIES, timeout=10)
-        data = resp.json()
-        if data.get("code") == 0:
-            new_days = data.get("data", {}).get("expire_days")
-            return new_days
-        else:
-            print(f"❌ 续期失败: {data.get('msg')}")
-            return None
-    except Exception as e:
-        print(f"❌ 续期异常: {e}")
-        return None
+          # 解析协议
+          if url.startswith("vless://"):
+              protocol = "vless"
+              content = url[8:]
+          elif url.startswith("vmess://"):
+              protocol = "vmess"
+              content = url[8:]
+          elif url.startswith("trojan://"):
+              protocol = "trojan"
+              content = url[9:]
+          elif url.startswith("ss://"):
+              protocol = "ss"
+              content = url[5:]
+          elif url.startswith("socks5://") or url.startswith("socks://"):
+              protocol = "socks5"
+              # 直接使用外部 SOCKS5
+              content = url.split("://")[1].split("#")[0]
+              if "@" in content:
+                  server = content.split("@")[1].split(":")[0]
+              else:
+                  server = content.split(":")[0]
+              print(f"[INFO] SOCKS5 -> {mask(server)}")
+              with open("use_external_socks.txt", "w") as f:
+                  f.write(url.split("#")[0])
+              sys.exit(0)
+          else:
+              print(f"[ERROR] 不支持的协议: {url.split('://')[0]}")
+              sys.exit(1)
 
-def start_server():
-    """启动服务器（如果脚本决定需要启动）"""
-    url = "https://www.lumixgame.com/api/server/start"
-    headers = {"Cookie": LUMIX_COOKIE}
-    try:
-        resp = requests.post(url, headers=headers, proxies=PROXIES, timeout=10)
-        return resp.status_code == 200
-    except:
-        return False
+          # 去除备注
+          if "#" in content:
+              content = content.rsplit("#", 1)[0]
 
-# ======================== 主逻辑 ================================
-def main():
-    print("\n============================ {lumix_renew.py} =============================")
-    print(f"🕐 运行时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+          config = {
+              "log": {"loglevel": "warning"},
+              "inbounds": [
+                  {"port": 10808, "listen": "127.0.0.1", "protocol": "socks", "settings": {"udp": True}},
+                  {"port": 10809, "listen": "127.0.0.1", "protocol": "http"}
+              ],
+              "outbounds": []
+          }
 
-    # 1. 出口 IP 验证
-    if not verify_ip():
-        sys.exit(1)
+          if protocol == "vless":
+              # vless://uuid@server:port?params
+              uuid, rest = content.split("@", 1)
+              if "?" in rest:
+                  host_port, params_str = rest.split("?", 1)
+              else:
+                  host_port, params_str = rest, ""
+              
+              if ":" in host_port:
+                  address, port = host_port.rsplit(":", 1)
+              else:
+                  address, port = host_port, "443"
+              
+              params = parse_qs(params_str)
+              security = params.get("security", ["none"])[0]
+              network = params.get("type", ["tcp"])[0]
+              sni = params.get("sni", [address])[0]
+              fp = params.get("fp", ["chrome"])[0]
+              flow = params.get("flow", [""])[0]
+              pbk = params.get("pbk", [""])[0]
+              host = params.get("host", [sni])[0]
+              path = unquote(params.get("path", ["/"])[0])
+              
+              print(f"[INFO] VLESS -> {mask(address)}:{port} (security: {security}, network: {network})")
+              
+              outbound = {
+                  "protocol": "vless",
+                  "settings": {
+                      "vnext": [{
+                          "address": address,
+                          "port": int(port),
+                          "users": [{"id": uuid, "encryption": "none"}]
+                      }]
+                  },
+                  "streamSettings": {
+                      "network": network,
+                      "security": security
+                  }
+              }
+              
+              # 添加 flow
+              if flow:
+                  outbound["settings"]["vnext"][0]["users"][0]["flow"] = flow
+              
+              # Reality 设置
+              if security == "reality":
+                  outbound["streamSettings"]["realitySettings"] = {
+                      "serverName": sni,
+                      "fingerprint": fp,
+                      "publicKey": pbk
+                  }
+              # TLS 设置
+              elif security == "tls":
+                  outbound["streamSettings"]["tlsSettings"] = {
+                      "serverName": sni,
+                      "fingerprint": fp,
+                      "allowInsecure": False
+                  }
+              
+              # WebSocket 设置
+              if network == "ws":
+                  outbound["streamSettings"]["wsSettings"] = {
+                      "path": path,
+                      "headers": {"Host": host}
+                  }
+              # gRPC 设置
+              elif network == "grpc":
+                  service_name = params.get("serviceName", [""])[0]
+                  outbound["streamSettings"]["grpcSettings"] = {
+                      "serviceName": service_name
+                  }
+              
+              config["outbounds"].append(outbound)
 
-    # 2. 获取当前状态和剩余天数
-    status, days_left = get_server_status()
-    if status is None:
-        print("❌ 无法获取服务器状态，退出")
-        sys.exit(1)
+          elif protocol == "vmess":
+              # vmess://base64
+              try:
+                  # 处理 URL 安全的 base64
+                  padding = 4 - len(content) % 4
+                  if padding != 4:
+                      content += "=" * padding
+                  decoded = base64.b64decode(content).decode("utf-8")
+                  vm = json.loads(decoded)
+              except Exception as e:
+                  print(f"[ERROR] VMess 解析失败: {e}")
+                  sys.exit(1)
+              
+              address = vm.get("add", "")
+              port = int(vm.get("port", 443))
+              uuid = vm.get("id", "")
+              aid = int(vm.get("aid", 0))
+              network = vm.get("net", "tcp")
+              tls = vm.get("tls", "")
+              sni = vm.get("sni", "") or vm.get("host", address)
+              host = vm.get("host", address)
+              path = vm.get("path", "/")
+              fp = vm.get("fp", "chrome")
+              
+              print(f"[INFO] VMess -> {mask(address)}:{port} (network: {network}, tls: {tls})")
+              
+              outbound = {
+                  "protocol": "vmess",
+                  "settings": {
+                      "vnext": [{
+                          "address": address,
+                          "port": port,
+                          "users": [{"id": uuid, "alterId": aid, "security": "auto"}]
+                      }]
+                  },
+                  "streamSettings": {
+                      "network": network,
+                      "security": "tls" if tls == "tls" else "none"
+                  }
+              }
+              
+              if tls == "tls":
+                  outbound["streamSettings"]["tlsSettings"] = {
+                      "serverName": sni,
+                      "fingerprint": fp,
+                      "allowInsecure": False
+                  }
+              
+              if network == "ws":
+                  outbound["streamSettings"]["wsSettings"] = {
+                      "path": path,
+                      "headers": {"Host": host}
+                  }
+              
+              config["outbounds"].append(outbound)
 
-    print(f"🖥️ 服务器状态: {status}")
-    print(f"📅 剩余天数: {days_left} 天")
+          elif protocol == "trojan":
+              # trojan://password@server:port?params
+              password, rest = content.split("@", 1)
+              if "?" in rest:
+                  host_port, params_str = rest.split("?", 1)
+              else:
+                  host_port, params_str = rest, ""
+              
+              if ":" in host_port:
+                  address, port = host_port.rsplit(":", 1)
+              else:
+                  address, port = host_port, "443"
+              
+              params = parse_qs(params_str)
+              sni = params.get("sni", [address])[0]
+              network = params.get("type", ["tcp"])[0]
+              host = params.get("host", [sni])[0]
+              path = unquote(params.get("path", ["/"])[0])
+              fp = params.get("fp", ["chrome"])[0]
+              
+              print(f"[INFO] Trojan -> {mask(address)}:{port} (network: {network})")
+              
+              outbound = {
+                  "protocol": "trojan",
+                  "settings": {
+                      "servers": [{
+                          "address": address,
+                          "port": int(port),
+                          "password": password
+                      }]
+                  },
+                  "streamSettings": {
+                      "network": network,
+                      "security": "tls",
+                      "tlsSettings": {
+                          "serverName": sni,
+                          "fingerprint": fp,
+                          "allowInsecure": False
+                      }
+                  }
+              }
+              
+              if network == "ws":
+                  outbound["streamSettings"]["wsSettings"] = {
+                      "path": path,
+                      "headers": {"Host": host}
+                  }
+              
+              config["outbounds"].append(outbound)
 
-    # 3. 续期逻辑（最多 MAX_RENEW_ATTEMPTS 次，上限 MAX_DAYS 天）
-    renew_count = 0
-    current_days = days_left
+          elif protocol == "ss":
+              # ss://base64@server:port 或 ss://base64#name
+              try:
+                  if "@" in content:
+                      # 新格式: base64(method:password)@server:port
+                      encoded, server_part = content.split("@", 1)
+                      decoded = base64.b64decode(encoded + "==").decode("utf-8")
+                      method, password = decoded.split(":", 1)
+                      address, port = server_part.split(":", 1)
+                  else:
+                      # 旧格式: base64(method:password@server:port)
+                      decoded = base64.b64decode(content + "==").decode("utf-8")
+                      if "@" in decoded:
+                          user_part, server_part = decoded.split("@", 1)
+                          method, password = user_part.split(":", 1)
+                          address, port = server_part.split(":", 1)
+                      else:
+                          raise ValueError("无法解析")
+              except Exception as e:
+                  print(f"[ERROR] Shadowsocks 解析失败: {e}")
+                  sys.exit(1)
+              
+              print(f"[INFO] Shadowsocks -> {mask(address)}:{port}")
+              
+              outbound = {
+                  "protocol": "shadowsocks",
+                  "settings": {
+                      "servers": [{
+                          "address": address,
+                          "port": int(port),
+                          "method": method,
+                          "password": password
+                      }]
+                  }
+              }
+              
+              config["outbounds"].append(outbound)
 
-    if current_days < MAX_DAYS:
-        print(f"🔄 开始续期 ({current_days} → {MAX_DAYS} 天)...")
-        for attempt in range(MAX_RENEW_ATTEMPTS):
-            # 如果已经达到上限，停止续期
-            if current_days >= MAX_DAYS:
-                break
-            new_days = perform_renew()
-            if new_days is None:
-                print("⚠️ 续期请求失败，停止续期")
-                break
-            renew_count += 1
-            current_days = new_days
-            print(f"  → 第 {renew_count} 次续期后剩余 {current_days} 天")
-            time.sleep(1)  # 避免请求过快
-        print(f"✅ 续期完成！共续期 {renew_count} 次，当前 {current_days} 天")
-    else:
-        print("✅ 无需续期")
+          # 保存配置
+          with open("xray_config.json", "w") as f:
+              json.dump(config, f, indent=2)
+          
+          print("[INFO] ✅ 代理配置已生成")
+          PYEOF
+          
+          # 检查是否使用外部 SOCKS5
+          if [ -f "use_external_socks.txt" ]; then
+            EXTERNAL_SOCKS=$(cat use_external_socks.txt)
+            echo "PROXY_SOCKS5=$EXTERNAL_SOCKS" >> $GITHUB_ENV
+            echo "[INFO] ✅ 使用外部 SOCKS5 代理"
+            exit 0
+          fi
+          
+          # 启动 Xray
+          ./xray/xray run -c xray_config.json > xray.log 2>&1 &
+          sleep 5
+          
+          # 测试代理
+          echo "[INFO] 测试代理连接..."
+          for i in 1 2 3 4 5; do
+            if curl -x socks5://127.0.0.1:10808 -s --max-time 15 https://api.ipify.org > /dev/null 2>&1; then
+              echo "[INFO] ✅ 代理连接成功"
+              echo "PROXY_SOCKS5=socks5://127.0.0.1:10808" >> $GITHUB_ENV
+              exit 0
+            fi
+            echo "[WARN] 尝试 $i/5..."
+            sleep 3
+          done
+          
+          echo "[ERROR] ❌ 代理连接失败"
+          echo "--- Xray 日志 ---"
+          cat xray.log
+          exit 1
 
-    # 4. 启动服务器（根据日志：只有状态为 online 时才跳过启动，其他状态均跳过，但注释保留）
-    # 日志输出：⏭️  启动: 服务器已在线，跳过
-    if status == "online":
-        print("⏭️  启动: 服务器已在线，跳过")
-    else:
-        # 若需要自动启动，取消下方注释；否则保持“跳过”行为
-        print("⏭️  启动: 服务器未在线，脚本设置为跳过（如需自动启动请修改代码）")
-        # 可选：取消注释以下代码以自动启动
-        # if start_server():
-        #     print("✅ 启动成功")
-        # else:
-        #     print("❌ 启动失败")
+      - name: 执行自动化登录
+        env:
+          ICEHOST_EMAIL: ${{ secrets.ICEHOST_EMAIL }}
+          ICEHOST_PASSWORD: ${{ secrets.ICEHOST_PASSWORD }}
+          PROXY_SOCKS5: ${{ env.PROXY_SOCKS5 }}
+        run: |
+          # 必须使用 1920x1080 确保验证码方框位置符合脚本预期
+          xvfb-run --server-args="-screen 0 1920x1080x24" python3 icehost_login.py
 
-    # 5. Telegram 推送
-    tg_send(f"Lumix 续期完成 | 剩余 {current_days} 天 | 续期 {renew_count} 次")
-
-    print("\n===================== {lumix_renew.py} passed ======================")
-
-if __name__ == "__main__":
-    if not LUMIX_COOKIE:
-        print("❌ 错误: 环境变量 LUMIX_COOKIE 未设置")
-        sys.exit(1)
-    main()
+      - name: Upload Artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: icehost-debug
+          path: "*.png"
