@@ -1,11 +1,16 @@
 name: IceHost Hourly KeepAlive
 
 on:
-  workflow_dispatch: # 由外部定时（如 cron-job.org）进行每小时触发
+  workflow_dispatch:
+  schedule:
+    - cron: '0 * * * *'
 
 jobs:
   check-and-start:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
     steps:
       - name: Checkout main code
         uses: actions/checkout@v4
@@ -14,9 +19,9 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: gunqio/zhiyong
-          token: ${{ secrets.PAT }}          # 访问私库的 Token
-          path: zhiyong                      # 拉取到 zhiyong/ 子目录
-          # ssh-key: ${{ secrets.SSH_KEY }}  # 或者用 SSH Key 方式
+          token: ${{secrets.PAT }}
+          path: zhiyong
+          fetch-depth: 1
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -25,6 +30,7 @@ jobs:
 
       - name: Install dependencies
         run: |
+          python -m pip install --upgrade pip
           pip install seleniumbase requests
 
       - name: Set up WARP
@@ -34,8 +40,7 @@ jobs:
         env:
           ICEHOST_SERVER_URL: ${{ secrets.ICEHOST_SERVER_URL }}
           ICEHOST_COOKIES: ${{ secrets.ICEHOST_COOKIES }}
-          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
-          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKENTG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
         run: python icehost_run.py
 
       - name: Upload Debug Screenshot
