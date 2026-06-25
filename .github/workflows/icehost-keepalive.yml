@@ -36,20 +36,26 @@ jobs:
       - name: Set up WARP
         uses: fscarmen/warp-on-actions@v1.1
 
+      # (可选) 调试：列出文件，确认脚本位置
+      - name: List files for debug
+        run: |
+          echo "=== Main repo root ==="
+          ls -la
+          echo "=== zhiyong repo ==="
+          ls -la zhiyong/
+
       - name: Run check script
         env:
           ICEHOST_SERVER_URL: ${{ secrets.ICEHOST_SERVER_URL }}
           ICEHOST_COOKIES: ${{ secrets.ICEHOST_COOKIES }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-        # 如果脚本位于主仓库，则直接运行；如果位于 zhiyong，则改为：
-        # run: cd zhiyong && python icehost_run.py
-        run: python icehost_run.py
+        run: cd zhiyong && python icehost_run.py
 
       - name: Upload Debug Screenshot
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: icehost-debug-screenshot
-          path: icehost_debug_screenshot.png
+          path: zhiyong/icehost_debug_screenshot.png   # 假设脚本在zhiyong目录下生成截图
           if-no-files-found: ignore
