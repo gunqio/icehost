@@ -7,16 +7,16 @@ jobs:
   check-and-start:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout current code
+      - name: Checkout main code
         uses: actions/checkout@v4
 
-      # 🆕 新增：拉取私有仓库 gunqio/zhiyong 的代码
-      - name: Checkout private repo
+      - name: Checkout private repo (gunqio/zhiyong)
         uses: actions/checkout@v4
         with:
           repository: gunqio/zhiyong
-          token: ${{ secrets.GH_PAT }} # 需要你在当前仓库配置此 Secret（见下方说明）
-          path: zhiyong-repo # 将私有库拉取到该子目录，避免覆盖当前目录文件
+          token: ${{ secrets.PAT }}          # 访问私库的 Token
+          path: zhiyong                      # 拉取到 zhiyong/ 子目录
+          # ssh-key: ${{ secrets.SSH_KEY }}  # 或者用 SSH Key 方式
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -25,10 +25,8 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install playwright requests
-          playwright install chromium
+          pip install seleniumbase requests
 
-      # ⚡ 核心新增：在运行脚本前，一键启动全局 Cloudflare WARP 代理，完美绕过 IP 阻断
       - name: Set up WARP
         uses: fscarmen/warp-on-actions@v1.1
 
@@ -38,12 +36,7 @@ jobs:
           ICEHOST_COOKIES: ${{ secrets.ICEHOST_COOKIES }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-        # 如果你的 icehost_run.py 存在于私有库中，先将其复制到当前根目录，然后再运行
-        run: |
-          if [ -f "zhiyong-repo/icehost_run.py" ]; then
-            cp zhiyong-repo/icehost_run.py .
-          fi
-          python icehost_run.py
+        run: python icehost_run.py
 
       - name: Upload Debug Screenshot
         if: always()
